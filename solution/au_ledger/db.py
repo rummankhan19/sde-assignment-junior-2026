@@ -20,11 +20,14 @@ CREATE TABLE IF NOT EXISTS dispositions (
     PRIMARY KEY (workflow_id, code)
 );
 
--- One row per input file ever ingested. Makes re-ingest a no-op and holds the
--- per-file counters that data_quality.json is summed from.
+-- One row per input file ever ingested. A file's identity is its name plus its content
+-- (workflow + file name + SHA-256), so re-ingesting a drop is a no-op, while the same
+-- content redelivered under a new name is processed (and its rows counted as duplicates).
+-- Also holds the per-file counters that data_quality.json is summed from.
 CREATE TABLE IF NOT EXISTS ingested_files (
     file_id      INTEGER PRIMARY KEY,
     kind         TEXT NOT NULL CHECK (kind IN ('leads', 'events')),
+    file_name    TEXT NOT NULL,
     sha256       TEXT NOT NULL,
     source_path  TEXT NOT NULL,
     workflow_id  TEXT,             -- leads only
@@ -35,9 +38,10 @@ CREATE TABLE IF NOT EXISTS ingested_files (
     rows_merged  INTEGER NOT NULL DEFAULT 0,
     field_warnings INTEGER NOT NULL DEFAULT 0,
     malformed    INTEGER NOT NULL DEFAULT 0,
-    duplicates   INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (kind, sha256)
+    duplicates   INTEGER NOT NULL DEFAULT 0
 );
+CREATE UNIQUE INDEX IF NOT EXISTS ux_file_identity
+    ON ingested_files (kind, COALESCE(workflow_id, ''), file_name, sha256);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_lead_batch ON ingested_files (workflow_id, batch_id)
     WHERE kind = 'leads';
 
@@ -102,6 +106,10 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ingested_files)")}
+    if cols and "file_name" not in cols:
+        raise SystemExit(f"{path} was created by an older version of au-ledger; "
+                         "delete it (and re-ingest) to upgrade.")
     conn.executescript(SCHEMA)
     return conn
 

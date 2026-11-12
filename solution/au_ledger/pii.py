@@ -35,12 +35,12 @@ class PiiVault:
     def load(cls, key_file: Path) -> "PiiVault":
         env = os.environ.get("AU_PII_KEY")
         if env:
-            return cls(bytes.fromhex(env))
+            return cls(_parse_key(env, "AU_PII_KEY"))
         if not key_file.exists():
             key_file.parent.mkdir(parents=True, exist_ok=True)
             key_file.write_text(secrets.token_hex(32))
             key_file.chmod(0o600)
-        return cls(bytes.fromhex(key_file.read_text().strip()))
+        return cls(_parse_key(key_file.read_text(), f"key file {key_file}"))
 
     def blind_index(self, canonical_value: str) -> str:
         return hmac.new(self._index_key, canonical_value.encode(), hashlib.sha256).hexdigest()
@@ -52,3 +52,13 @@ class PiiVault:
     def decrypt(self, token: str) -> str:
         raw = base64.b64decode(token)
         return self._aead.decrypt(raw[:12], raw[12:], None).decode()
+
+
+def _parse_key(text: str, source: str) -> bytes:
+    try:
+        key = bytes.fromhex(text.strip())
+    except ValueError:
+        key = b""
+    if len(key) != 32:
+        raise SystemExit(f"{source} must be exactly 64 hex characters (a 32-byte key)")
+    return key

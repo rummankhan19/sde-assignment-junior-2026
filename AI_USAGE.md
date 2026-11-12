@@ -15,7 +15,7 @@ Claude Code (Claude Opus 5.5), running as an agent with shell access.
   - SQLite schema with append-only triggers
   - transactional, hash-keyed ingestion
   - SQL report derivation
-- Writing the 89-test pytest suite.
+- Writing the 99-test pytest suite.
 - Writing an independent, in-memory reference implementation of the report rules (not
   committed) and diffing the two on six datasets.
 - Drafting `SUBMISSION.md`.
@@ -40,11 +40,21 @@ Real mistakes from this session, caught along the way:
 - **A false claim in the write-up.** The first draft of `SUBMISSION.md` said some unknown codes
   came from overrides. Re-reading the generator showed overrides always use valid codes, so the
   claim was corrected.
+- **Review found five more bugs in its own code.** A second, edge-case review pass
+  turned up five problems the generator never triggers:
+  - Files were identified by content hash alone, so the same event file redelivered under a
+    new name was silently skipped and `events_total` undercounted.
+  - Non-UTF-8 CSVs crashed the ingest.
+  - Numeric JSON phones became orphans.
+  - Malformed keys produced raw tracebacks.
+  - A stale lead cache could crash when a second writer had added leads between drops.
+
+  Each one was reproduced first, then fixed, with a test that fails on the old code.
 - **Shell scripting slip.** The first cross-check script relied on bash word-splitting under
   zsh, so it "failed" without running anything. It was rewritten as an explicit bash script.
 
 ## How I verified AI-generated code
-- 89 unit and end-to-end tests (`pytest solution`).
+- 99 unit and end-to-end tests (`pytest solution`).
 - Byte-for-byte diff against an independently written reference implementation on seeds 42,
   7, 1, 2026 and 99 (small) and 42 (large).
 - Incremental vs all-at-once vs re-ingest compared byte-for-byte on every seed.

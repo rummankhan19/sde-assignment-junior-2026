@@ -15,7 +15,7 @@ au-ledger ingest data/drop_1
 au-ledger ingest data/drop_2
 au-ledger report --out reports/
 
-pytest solution                           # 89 tests, ~2s
+pytest solution                           # 99 tests, ~2s
 ```
 - `au-ledger ingest data` (a folder of `drop_*`) or `au-ledger ingest data/drop_1 data/drop_2`
   ingests everything at once, in natural drop order. The result is identical to ingesting the
@@ -51,7 +51,7 @@ each report by joining against the leads that exist *now*. This means:
 
 | Table | Purpose / key constraints |
 |---|---|
-| `ingested_files` | One row per ingested file, keyed `UNIQUE(kind, sha256)`. Makes re-ingest a no-op and holds the per-file counters (`rows_total`, `rows_rejected`, `rows_merged`, `field_warnings`, `malformed`, `duplicates`) that `data_quality.json` sums. Partial unique index on `(workflow_id, batch_id)` for lead files. |
+| `ingested_files` | One row per ingested file. Its identity is workflow + file name + SHA-256 of the content (unique index). Makes re-ingest a no-op and holds the per-file counters (`rows_total`, `rows_rejected`, `rows_merged`, `field_warnings`, `malformed`, `duplicates`) that `data_quality.json` sums. Partial unique index on `(workflow_id, batch_id)` for lead files. |
 | `leads` | Current merged state. `UNIQUE(workflow_id, phone_hash)` is the lead identity. `batch_id` is set from the first valid row; a trigger makes it (and the identity columns) immutable. Non-PII fields go in `attrs` (JSON, since schemas differ per workflow); PII goes in `pii_enc` (JSON of ciphertexts). |
 | `lead_rejections` | `PK(workflow_id, batch_id, row_number)` plus a reason. No PII. |
 | `events` | The ledger. `event_id` PK (dedupe across all drops). `occurred_at_us` is UTC epoch microseconds, so it sorts correctly whatever the source format, and the raw string is kept for audit. Stores `phone_hash`, never the phone. Indexed on `(workflow_id, phone_hash)` and `(workflow_id, call_id)`. |
@@ -79,7 +79,9 @@ snapshot even if an ingest runs concurrently.
 | Decision | Why | Alternative considered |
 |---|---|---|
 | Linking (and therefore orphan and unknown-disposition counts) is derived at report time | Orphans must link once their lead arrives, and counts must reflect the final state. Deriving is simpler and safer than re-linking. | Resolve links at ingest plus a re-link pass when leads arrive. Faster reports, but it mutates the ledger or a side table. |
-| File identity = SHA-256 of the content; a seen file is skipped whole | "Re-running ingest changes nothing" includes `events_total` and malformed counts, which per-event dedupe alone would double. | Key on path: breaks if the data directory is moved or renamed. |
+| File identity = workflow + file **name** + SHA-256 of the content; a file seen with the same name and content is skipped whole | "Re-running ingest changes nothing" includes `events_total` and malformed counts, which per-event dedupe alone would double. Including the name means the same content redelivered under a *new* name is processed, so its lines count toward `events_total` and as duplicates, as the spec requires. (Content alone silently skipped such a copy; this was found in review.) | Content hash only: undercounts redeliveries. Full path: breaks if the data directory is moved. |
+| A lead CSV that isn't valid UTF-8 is decoded as Windows-1252 (Latin-1 as a last resort), with a warning | Excel on Windows saves CSVs this way. Refusing the whole drop over one accented name is worse than a flagged fallback. | Fail the drop with an error. |
+| A JSON-number `phone` in an event is treated like a string (booleans are not) | It's a common producer mistake, and the digits are unambiguous. | Treat it as an orphan. |
 | Same `(workflow, batch_id)` with **different** content → error, and the whole drop rolls back | `batch_id` is permanent by spec, so silently mixing two versions of a batch would corrupt reports. Fail loudly and let a human decide. | Treat it as a new batch, or overwrite. |
 | A required field that is present but invalid (non-phone) → `invalid:<field>` | The spec only defines `invalid_phone`. Today's schemas have no such field, but the rule had to go somewhere. | Treat it as `missing_required:<field>`. |
 | Two columns mapping to the same field → the left-most wins | Deterministic and easy to explain. | Take the first non-empty value per row. |
@@ -99,21 +101,26 @@ snapshot even if an ingest runs concurrently.
 | `last_call_at` is truncated to whole seconds | Every input has whole seconds and the spec example has none. | Keep microseconds when present. |
 
 ## Failure modes considered
-- **Re-running a drop, or overlapping drops:** whole files are skipped by hash, events are deduped
-  by `event_id` across drops, and nothing is double-counted. Tested.
+- **Re-running a drop, or overlapping drops:** files already seen (same name and content) are skipped,
+  events are deduped by `event_id` across drops, and nothing is double-counted. A file
+  redelivered under a new name is processed and its rows count as duplicates. Tested.
 - **Crash mid-ingest:** a single transaction per drop, so the database is untouched and running
   it again is clean.
-- **Wrong or lost PII key:** refused via the fingerprint. (A *lost* key means encrypted PII can't
+- **Wrong, malformed or lost PII key:** a wrong key is refused via the fingerprint; a malformed
+  `AU_PII_KEY` or key file gets a clear error, not a traceback. (A *lost* key means encrypted PII can't
   be recovered and new hashes won't match. In production the key belongs in a KMS, not a file.)
 - **Dirty leads:** BOM, renamed or reordered or extra columns, blank rows, short rows (missing
-  cells = missing), every phone/date/amount format from the generator, impossible dates, and
-  negative amounts.
+  cells = missing), every phone/date/amount format from the generator, impossible dates,
+  negative amounts, and non-UTF-8 (Windows-1252) files.
 - **Dirty events:** truncated JSON, non-object JSON, missing `event_id`, invalid UTF-8, invalid
   or never-uploaded phones, overrides for unknown calls, codes from another workflow's catalogue,
   out-of-order events (ordering always uses `occurred_at`, never file order), and events before
   their lead.
-- **Concurrent runs:** `BEGIN IMMEDIATE` serialises ingests (with a 30s busy timeout), and
-  reports read a snapshot.
+- **Concurrent runs:** `BEGIN IMMEDIATE` serialises ingests (with a 30s busy timeout), the
+  in-memory lead cache is reloaded under the lock at the start of every drop (so a lead
+  another process added in between is merged, not re-inserted), and reports read a snapshot.
+- **Database from an older version** (different `ingested_files` layout): refused with a
+  message to rebuild, rather than failing halfway.
 - **Not handled:**
   - Corrected re-uploads of a batch (refused by design; this needs a product decision).
   - Deleting or "forgetting" a lead (GDPR/DPDP erasure): the ledger is append-only. The usual
@@ -123,7 +130,7 @@ snapshot even if an ingest runs concurrently.
   - Very large files are read into memory: fine at ~5 MB per file, but not for multi-GB files.
 
 ## Testing
-- `pytest solution`: **89 tests**, using a temp DB per test with no shared state.
+- `pytest solution`: **99 tests**, using a temp DB per test with no shared state.
   - `test_normalize.py`: all six phone formats plus nine invalid kinds (including the
     `91`/`0` prefix edge cases), every date format plus impossible dates, currency and rounding,
     enums, header normalisation, and that the three timestamp forms are the same instant, with
@@ -139,14 +146,20 @@ snapshot even if an ingest runs concurrently.
     or WAL bytes, PII decryptable, wrong key refused.
   - `test_generated_data.py`: runs the provided generator on two seeds and checks invariants:
     incremental == all-at-once byte-for-byte, and the totals reconcile across all reports.
+  - `test_robustness.py`: edge cases found in a review pass: a file redelivered under a new
+    name, a lead batch copied under a new name, Windows-1252 CSVs, numeric phones, malformed
+    keys, a second writer between drops, and an old database layout. All 10 tests were
+    confirmed to fail on the code before the fix.
 - **Independent cross-check (not committed):** I wrote a second, in-memory implementation of
   the linking, effective-disposition, bucket and report rules with no SQL. Outputs were
-  **byte-identical** on seeds 42, 7, 1, 2026 and 99 (small) and seed 42 (large). It shares the
+  **byte-identical** on seeds 42, 7, 1, 2026, 99, 3, 11, 123, 777 and 31337 (small) and seed 42
+  (large). It shares the
   normalisation functions, which are unit-tested separately.
 - **Mutation check:** I broke six rules by hand and made sure a test fails for each. One mutation
   (dropping override precedence) survived at first, which is how
   `test_any_override_beats_a_later_set` came about.
-- **Not tested:** PostgreSQL (SQLite only), concurrent ingest processes, and files bigger than
+- **Not tested:** PostgreSQL (SQLite only), truly simultaneous ingest processes (the
+  between-drops case is tested with two connections), and files bigger than
   memory.
 
 ## Results
@@ -155,7 +168,7 @@ Timings on a MacBook, SQLite in WAL mode:
 | Dataset | ingest drop_1 | ingest drop_2 | report | total |
 |---|---|---|---|---|
 | small (seed 42: 2,057 lead rows, 8,745 event lines) | 0.09 s | 0.08 s | 0.06 s | < 1 s |
-| large (seed 42: 143,990 lead rows, 632,602 event lines) | ~10 s | ~11 s | ~11 s | **~32 s wall** |
+| large (seed 42: 143,990 lead rows, 632,602 event lines) | ~10 s | ~12 s | ~11 s | **~34 s wall** |
 
 Small-seed-42 `data_quality.json`: 108 rejected rows (42 `invalid_phone`, 25/13/14/14
 `missing_required:*`), 57 merged duplicates, 122 field warnings, 8 malformed lines, 237
@@ -178,7 +191,7 @@ Things in the data worth flagging:
 - **Incremental:** drop 2 never re-reads drop 1, and only new files are processed. Trade-off: the
   report is a full recompute, ~11 s at 140k leads. At much larger scale I'd keep a
   `call_facts` table maintained incrementally per affected `call_id`/lead.
-- **Performance:** ~32 s for the large dataset, well under the 2-minute target.
+- **Performance:** ~34 s for the large dataset, well under the 2-minute target.
 - **SQL aggregation:** all report logic is in SQL (`report.py`); Python only formats output.
 
 ## Running this in production (100k leads/day)

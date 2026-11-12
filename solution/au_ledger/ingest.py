@@ -63,12 +63,14 @@ class Ingestor:
         summary = IngestSummary()
         for drop in expand_drops(paths):
             self.conn.execute("BEGIN IMMEDIATE")
+            # Reload leads under the write lock: another process may have committed leads
+            # since our last drop, and a stale cache would try to insert them again.
+            self._lead_cache.clear()
             try:
                 self._ingest_drop(drop, summary)
                 self.conn.execute("COMMIT")
             except BaseException:
                 self.conn.execute("ROLLBACK")
-                self._lead_cache.clear()
                 raise
         return summary
 
@@ -89,8 +91,10 @@ class Ingestor:
     def _register_file(self, kind: str, path: Path, data: bytes, summary: IngestSummary,
                        workflow_id: str | None = None, batch_id: str | None = None) -> int | None:
         sha = hashlib.sha256(data).hexdigest()
-        if self.conn.execute("SELECT 1 FROM ingested_files WHERE kind = ? AND sha256 = ?",
-                             (kind, sha)).fetchone():
+        if self.conn.execute(
+                "SELECT 1 FROM ingested_files WHERE kind = ? AND COALESCE(workflow_id, '') = ? "
+                "AND file_name = ? AND sha256 = ?",
+                (kind, workflow_id or "", path.name, sha)).fetchone():
             summary.files_skipped += 1
             return None
         if kind == "leads":
@@ -103,8 +107,8 @@ class Ingestor:
                     f"{clash['source_path']} with different content. Batch ids are permanent; "
                     "re-upload corrections under a new batch name.")
         cur = self.conn.execute(
-            "INSERT INTO ingested_files (kind, sha256, source_path, workflow_id, batch_id) "
-            "VALUES (?, ?, ?, ?, ?)", (kind, sha, str(path), workflow_id, batch_id))
+            "INSERT INTO ingested_files (kind, file_name, sha256, source_path, workflow_id, batch_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)", (kind, path.name, sha, str(path), workflow_id, batch_id))
         summary.files_ingested += 1
         return cur.lastrowid
 
@@ -130,7 +134,7 @@ class Ingestor:
         phone_field, ref_field = schema.phone_field, schema.reference_field
         leads = self._leads_for(workflow_id)
 
-        reader = csv.reader(io.StringIO(data.decode("utf-8-sig"), newline=""))
+        reader = csv.reader(io.StringIO(_decode_csv(data, path, summary), newline=""))
         header = next(reader, None) or []
         colmap = schema.map_headers(header)
 
@@ -228,13 +232,31 @@ class Ingestor:
         if ts is None:
             return None  # an event we cannot place in time cannot be reported on
         payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-        phone = normalise_phone(ev["phone"]) if isinstance(ev.get("phone"), str) else None
+        raw_phone = ev.get("phone")
+        if isinstance(raw_phone, int) and not isinstance(raw_phone, bool):
+            raw_phone = str(raw_phone)  # some producers send the number as a JSON integer
+        phone = normalise_phone(raw_phone) if isinstance(raw_phone, str) else None
         code = payload.get("disposition_code")
         return (event_id.strip(), _str_or_none(ev.get("event_type")), _str_or_none(ev.get("workflow_id")),
                 _str_or_none(ev.get("call_id")), to_epoch_us(ts), ev["occurred_at"],
                 self.vault.blind_index(phone) if phone else None,
                 code if isinstance(code, str) else None,
                 json.dumps(payload, sort_keys=True, ensure_ascii=False), file_id, line_no)
+
+
+def _decode_csv(data: bytes, path: Path, summary: IngestSummary) -> str:
+    """UTF-8 (with or without BOM). Files saved by Excel on Windows are often cp1252: fall back
+    to that rather than refusing the whole drop, and say so."""
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        text = data.decode("cp1252")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")  # never fails; last resort
+    summary.notes.append(f"{path}: not valid UTF-8, decoded as Windows-1252/Latin-1")
+    return text
 
 
 def _str_or_none(v):
