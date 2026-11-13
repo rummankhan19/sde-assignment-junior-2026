@@ -150,13 +150,12 @@ snapshot even if an ingest runs concurrently.
     name, a lead batch copied under a new name, Windows-1252 CSVs, numeric phones, malformed
     keys, a second writer between drops, and an old database layout. All 10 tests were
     confirmed to fail on the code before the fix.
-- **Independent cross-check (not committed):** I wrote a second, in-memory implementation of
-  the linking, effective-disposition, bucket and report rules with no SQL. Outputs were
+- **Independent cross-check (not committed):** a second, in-memory implementation of the
+  linking, effective-disposition, bucket and report rules was written with no SQL. Outputs were
   **byte-identical** on seeds 42, 7, 1, 2026, 99, 3, 11, 123, 777 and 31337 (small) and seed 42
-  (large). It shares the
-  normalisation functions, which are unit-tested separately.
-- **Mutation check:** I broke six rules by hand and made sure a test fails for each. One mutation
-  (dropping override precedence) survived at first, which is how
+  (large). It shares the normalisation functions, which are unit-tested separately.
+- **Mutation check:** six rules were broken on purpose, one at a time, to confirm a test fails
+  for each. One mutation (dropping override precedence) survived at first, which is how
   `test_any_override_beats_a_later_set` came about.
 - **Not tested:** PostgreSQL (SQLite only), truly simultaneous ingest processes (the
   between-drops case is tested with two connections), and files bigger than

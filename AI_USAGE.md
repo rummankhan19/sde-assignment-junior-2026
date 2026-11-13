@@ -61,7 +61,7 @@ These are real mistakes from this work, caught along the way:
 
 ## How I verified AI-generated code
 - 99 unit and end-to-end tests (`pytest solution`), which I also ran myself: all pass.
-- A byte-for-byte comparison against the separate reference implementation on 11 seeds plus
+- A byte-for-byte comparison against the separate reference implementation on 10 seeds plus
   the large dataset.
 - Day-by-day vs all-at-once vs re-run compared byte-for-byte.
 - Hand-made mutations of core rules, each confirmed to make a test fail.
